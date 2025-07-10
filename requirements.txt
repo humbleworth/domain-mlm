@@ -1,0 +1,7 @@
+torch>=2.0.0
+transformers>=4.30.0
+datasets>=2.10.0
+numpy<2.0  # Required for CANINE compatibility
+tqdm>=4.65.0
+wandb>=0.15.0  # For logging
+accelerate>=0.20.0  # For distributed training
