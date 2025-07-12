@@ -11,22 +11,26 @@ import logging
 import math
 import os
 import sys
+import random
+import shutil
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
+import multiprocessing
 
 import numpy as np
 import torch
-from datasets import Dataset, DatasetDict, load_dataset
+import torch.nn as nn
+import torch.nn.functional as F
+import wandb
+from datasets import Dataset, load_dataset
 from torch.utils.data import DataLoader
-from tqdm.auto import tqdm
+from torch.cuda.amp import autocast, GradScaler
+from tqdm import tqdm
 from transformers import (
     CanineModel,
     CanineConfig,
     CanineTokenizer,
-    DataCollatorForLanguageModeling,
-    EarlyStoppingCallback,
-    Trainer,
-    TrainingArguments,
+    get_linear_schedule_with_warmup,
     set_seed,
 )
 
@@ -37,7 +41,7 @@ if not np.__version__.startswith('1.'):
     sys.exit(1)
 
 
-class CanineForMaskedLM(torch.nn.Module):
+class CanineForMaskedLM(nn.Module):
     """Custom CANINE model with MLM head since it's not built-in."""
     
     def __init__(self, config):
@@ -50,11 +54,11 @@ class CanineForMaskedLM(torch.nn.Module):
         vocab_size = config.max_position_embeddings
         hidden_size = config.hidden_size
         
-        self.mlm_head = torch.nn.Sequential(
-            torch.nn.Linear(hidden_size, hidden_size),
-            torch.nn.GELU(),
-            torch.nn.LayerNorm(hidden_size),
-            torch.nn.Linear(hidden_size, vocab_size)
+        self.mlm_head = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.GELU(),
+            nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_size, vocab_size)
         )
         
         # Initialize weights
@@ -63,11 +67,11 @@ class CanineForMaskedLM(torch.nn.Module):
     def _init_weights(self):
         """Initialize the weights."""
         for module in self.mlm_head.modules():
-            if isinstance(module, torch.nn.Linear):
+            if isinstance(module, nn.Linear):
                 module.weight.data.normal_(mean=0.0, std=0.02)
                 if module.bias is not None:
                     module.bias.data.zero_()
-            elif isinstance(module, torch.nn.LayerNorm):
+            elif isinstance(module, nn.LayerNorm):
                 module.bias.data.zero_()
                 module.weight.data.fill_(1.0)
         
@@ -91,7 +95,7 @@ class CanineForMaskedLM(torch.nn.Module):
         
         masked_lm_loss = None
         if labels is not None:
-            loss_fct = torch.nn.CrossEntropyLoss()
+            loss_fct = nn.CrossEntropyLoss()
             masked_lm_loss = loss_fct(
                 prediction_scores.view(-1, self.config.max_position_embeddings),
                 labels.view(-1)
@@ -109,6 +113,78 @@ class CanineForMaskedLM(torch.nn.Module):
         return sum(p.numel() for p in self.parameters())
 
 
+class DomainMLMDataset(torch.utils.data.Dataset):
+    """Custom dataset for domain MLM."""
+    
+    def __init__(self, dataset, tokenizer, max_length=128):
+        self.dataset = dataset
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        
+    def __len__(self):
+        return len(self.dataset)
+    
+    def __getitem__(self, idx):
+        item = self.dataset[idx]
+        text = item['text']
+        
+        encoding = self.tokenizer(
+            text,
+            max_length=self.max_length,
+            padding='max_length',
+            truncation=True,
+            return_tensors='pt'
+        )
+        
+        return {
+            'input_ids': encoding['input_ids'].squeeze(),
+            'attention_mask': encoding['attention_mask'].squeeze(),
+        }
+
+
+class CanineDataCollatorForLanguageModeling:
+    """Custom data collator for CANINE MLM that uses character-level masking."""
+    
+    def __init__(self, tokenizer, mlm_probability=0.15):
+        self.tokenizer = tokenizer
+        self.mlm_probability = mlm_probability
+        # CANINE special tokens
+        self.cls_token_id = 57344  # [CLS]
+        self.sep_token_id = 57345  # [SEP] 
+        self.pad_token_id = 0       # [PAD]
+        self.mask_token_id = 0xE000  # Private use area character as mask (following train_canine_overfit.py)
+        
+    def __call__(self, examples):
+        # Stack all tensors
+        batch = {}
+        for key in examples[0].keys():
+            batch[key] = torch.stack([ex[key] for ex in examples])
+        
+        # Clone input_ids for labels
+        batch['labels'] = batch['input_ids'].clone()
+        
+        # Create probability matrix for masking
+        probability_matrix = torch.full(batch['labels'].shape, self.mlm_probability)
+        
+        # Don't mask special tokens
+        special_tokens_mask = (
+            (batch['input_ids'] == self.pad_token_id) | 
+            (batch['input_ids'] == self.cls_token_id) | 
+            (batch['input_ids'] == self.sep_token_id)
+        )
+        probability_matrix.masked_fill_(special_tokens_mask, value=0.0)
+        
+        # Apply masking
+        masked_indices = torch.bernoulli(probability_matrix).bool()
+        batch['labels'][~masked_indices] = -100  # Only compute loss on masked tokens
+        
+        # Following the CANINE paper and train_canine_overfit.py approach:
+        # Replace masked positions with the mask token (0xE000)
+        batch['input_ids'][masked_indices] = self.mask_token_id
+        
+        return batch
+
+
 # Set up logging
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -123,244 +199,325 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Pretrain CANINE on domain names using MLM"
     )
-    parser.add_argument(
-        "--epochs",
-        type=int,
-        default=5,
-        help="Number of training epochs (default: 5)",
-    )
-    parser.add_argument(
-        "--batch_size",
-        type=int,
-        default=64,
-        help="Batch size per device (default: 64)",
-    )
-    parser.add_argument(
-        "--lr",
-        type=float,
-        default=1e-5,
-        help="Learning rate (default: 1e-5)",
-    )
-    parser.add_argument(
-        "--use_wandb",
-        action="store_true",
-        help="Enable Weights & Biases logging",
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="./domain-canine-model",
-        help="Output directory for model (default: ./domain-canine-model)",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="Random seed for reproducibility (default: 42)",
-    )
-    parser.add_argument(
-        "--max_length",
-        type=int,
-        default=128,
-        help="Maximum sequence length (default: 128)",
-    )
-    parser.add_argument(
-        "--mlm_probability",
-        type=float,
-        default=0.10,
-        help="Masking probability for MLM (default: 0.10, optimized for domains)",
-    )
-    parser.add_argument(
-        "--warmup_ratio",
-        type=float,
-        default=0.1,
-        help="Warmup ratio for learning rate scheduler (default: 0.1)",
-    )
-    parser.add_argument(
-        "--weight_decay",
-        type=float,
-        default=0.01,
-        help="Weight decay for AdamW optimizer (default: 0.01)",
-    )
-    parser.add_argument(
-        "--gradient_accumulation_steps",
-        type=int,
-        default=1,
-        help="Gradient accumulation steps (default: 1)",
-    )
-    parser.add_argument(
-        "--eval_steps",
-        type=int,
-        default=500,
-        help="Evaluate every N steps (default: 500)",
-    )
-    parser.add_argument(
-        "--save_steps",
-        type=int,
-        default=1000,
-        help="Save checkpoint every N steps (default: 1000)",
-    )
-    parser.add_argument(
-        "--logging_steps",
-        type=int,
-        default=100,
-        help="Log every N steps (default: 100)",
-    )
-    parser.add_argument(
-        "--fp16",
-        action="store_true",
-        help="Use mixed precision training (fp16)",
-    )
-    parser.add_argument(
-        "--data_file",
-        type=str,
-        default="data/domains.txt",
-        help="Path to domains data file (default: data/domains.txt)",
-    )
+    # Training arguments
+    parser.add_argument("--epochs", type=int, default=5, help="Number of training epochs")
+    parser.add_argument("--batch_size", type=int, default=256, help="Batch size per device (optimized for A100)")
+    parser.add_argument("--learning_rate", type=float, default=1e-5, help="Learning rate")
+    parser.add_argument("--warmup_steps", type=int, default=500, help="Number of warmup steps")
+    parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay for AdamW")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=2, help="Gradient accumulation steps")
+    parser.add_argument("--gradient_clip_val", type=float, default=1.0, help="Gradient clipping value")
+    
+    # Model arguments
+    parser.add_argument("--max_length", type=int, default=128, help="Maximum sequence length")
+    parser.add_argument("--mlm_probability", type=float, default=0.15, help="Masking probability for MLM")
+    
+    # Dataset arguments
+    parser.add_argument("--dataset", type=str, default="humbleworth/registered-domains", help="HuggingFace dataset or local file")
+    parser.add_argument("--dataset_config", type=str, default=None, help="Dataset configuration name")
+    parser.add_argument("--dataset_split", type=str, default="train", help="Dataset split to use")
+    parser.add_argument("--num_samples", type=int, default=None, help="Number of samples to use (None for all)")
+    parser.add_argument("--streaming", action="store_true", help="Use streaming mode for large datasets")
+    parser.add_argument("--test_size", type=float, default=0.1, help="Validation set size as fraction")
+    parser.add_argument("--num_workers", type=int, default=None, help="Number of DataLoader workers (default: auto)")
+    
+    # Output arguments
+    parser.add_argument("--output_dir", type=str, default="./domain-canine-model", help="Output directory")
+    parser.add_argument("--log_dir", type=str, default="./logs", help="TensorBoard log directory")
+    parser.add_argument("--save_steps", type=int, default=10000, help="Save checkpoint every N steps")
+    parser.add_argument("--logging_steps", type=int, default=100, help="Log every N steps")
+    parser.add_argument("--eval_steps", type=int, default=500, help="Evaluate every N steps")
+    parser.add_argument("--save_total_limit", type=int, default=3, help="Maximum number of checkpoints to keep")
+    parser.add_argument("--early_stopping_patience", type=int, default=3, help="Early stopping patience")
+    
+    # Mixed precision and optimization
+    parser.add_argument("--use_amp", action="store_true", default=True, help="Use automatic mixed precision")
+    parser.add_argument("--fp16", action="store_true", help="Use FP16 mixed precision")
+    parser.add_argument("--bf16", action="store_true", default=True, help="Use BF16 mixed precision (default for A100)")
+    parser.add_argument("--no_mixed_precision", action="store_true", help="Disable mixed precision")
+    
+    # Logging and debugging
+    parser.add_argument("--use_wandb", action="store_true", help="Use Weights & Biases logging")
+    parser.add_argument("--wandb_project", type=str, default="domain-canine-pretrain", help="W&B project name")
+    parser.add_argument("--wandb_run_name", type=str, default=None, help="W&B run name")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--resume_from", type=str, default=None, help="Resume from checkpoint directory")
     
     return parser.parse_args()
 
 
-def load_and_prepare_data(data_path: str) -> Tuple[Dataset, Dataset]:
-    """
-    Load domain data from file and prepare train/validation splits.
-    
-    Args:
-        data_path: Path to domains.txt file
+def load_and_prepare_data(dataset_name: str, dataset_config: Optional[str] = None, 
+                         dataset_split: str = "train", num_samples: Optional[int] = None,
+                         streaming: bool = False, test_size: float = 0.1) -> Tuple[Dataset, Dataset]:
+    """Load domain data from HuggingFace dataset or local file."""
+    # Check if it's a local file
+    if os.path.exists(dataset_name):
+        logger.info(f"Loading data from local file: {dataset_name}")
         
-    Returns:
-        Tuple of (train_dataset, eval_dataset)
-    """
-    # Check if data file exists
-    if not os.path.exists(data_path):
-        raise FileNotFoundError(
-            f"Data file not found: {data_path}\n"
-            f"Please ensure you have domains.txt in the data/ directory"
-        )
+        # Load domains from file
+        with open(dataset_name, 'r', encoding='utf-8') as f:
+            domains = [line.strip() for line in f if line.strip()]
+        
+        # Remove duplicates
+        original_count = len(domains)
+        domains = list(set(domains))
+        dedupe_count = len(domains)
+        
+        logger.info(f"Loaded {original_count} domains, {dedupe_count} after deduplication")
+        
+        # Create dataset
+        dataset = Dataset.from_dict({"text": domains})
+    else:
+        # Load from HuggingFace
+        logger.info(f"Loading dataset from HuggingFace: {dataset_name}")
+        
+        # Load dataset with optional configuration
+        load_kwargs = {
+            "path": dataset_name,
+            "split": dataset_split,
+            "streaming": streaming
+        }
+        if dataset_config:
+            load_kwargs["name"] = dataset_config
+            
+        dataset = load_dataset(**load_kwargs)
+        
+        # For streaming datasets, we can't get the exact count
+        if streaming:
+            logger.info("Using streaming mode - exact dataset size unknown")
+        else:
+            logger.info(f"Loaded {len(dataset):,} examples from HuggingFace")
     
-    logger.info(f"Loading data from {data_path}")
+    # Limit samples if requested
+    if num_samples and not streaming:
+        dataset = dataset.select(range(min(num_samples, len(dataset))))
+        logger.info(f"Limited to {len(dataset):,} samples")
     
-    # Load domains from file
-    with open(data_path, 'r', encoding='utf-8') as f:
-        domains = [line.strip() for line in f if line.strip()]
+    # For streaming datasets, take a subset
+    if streaming and num_samples:
+        dataset = dataset.take(num_samples)
+        logger.info(f"Will stream up to {num_samples:,} samples")
     
-    # Remove duplicates
-    original_count = len(domains)
-    domains = list(set(domains))
-    dedupe_count = len(domains)
+    # Log dataset statistics (for non-streaming datasets)
+    if not streaming:
+        # Get text column (handle different column names)
+        text_column = None
+        for col in ["text", "domain", "domains", "content", "raw"]:
+            if col in dataset.column_names:
+                text_column = col
+                break
+        
+        if text_column:
+            # Rename column to 'text' if needed
+            if text_column != "text":
+                dataset = dataset.rename_column(text_column, "text")
+                logger.info(f"Renamed column '{text_column}' to 'text'")
+            
+            # Calculate statistics
+            texts = dataset["text"][:10000]  # Sample for statistics
+            domain_lengths = [len(d) for d in texts]
+            logger.info(f"Average domain length: {np.mean(domain_lengths):.1f} characters")
+            logger.info(f"Max domain length: {max(domain_lengths)} characters")
+            logger.info(f"Min domain length: {min(domain_lengths)} characters")
+        else:
+            raise ValueError(f"Could not find text column in dataset. Available columns: {dataset.column_names}")
     
-    logger.info(f"Loaded {original_count} domains, {dedupe_count} after deduplication")
+    # Split into train/validation
+    if streaming:
+        # For streaming, we'll manually split
+        # Note: This is a simple split strategy for streaming datasets
+        # The eval dataset will see different data than train
+        train_dataset = dataset
+        if num_samples:
+            skip_amount = int(num_samples * (1 - test_size))
+            take_amount = int(num_samples * test_size)
+        else:
+            skip_amount = 10000000  # Skip first 10M for eval
+            take_amount = 1000000   # Take 1M for eval
+        eval_dataset = dataset.skip(skip_amount).take(take_amount)
+        logger.info("Created train/eval splits for streaming dataset")
+    else:
+        dataset_dict = dataset.train_test_split(test_size=test_size, seed=42)
+        train_dataset = dataset_dict['train']
+        eval_dataset = dataset_dict['test']
+        
+        logger.info(f"Train examples: {len(train_dataset):,}")
+        logger.info(f"Validation examples: {len(eval_dataset):,}")
     
-    # Warning if dataset is small
-    if dedupe_count < 1_000_000:
-        logger.warning(
-            f"Dataset contains only {dedupe_count:,} domains. "
-            f"For best results, 1M+ domains are recommended."
-        )
-    
-    # Log dataset statistics
-    domain_lengths = [len(d) for d in domains]
-    logger.info(f"Average domain length: {np.mean(domain_lengths):.1f} characters")
-    logger.info(f"Max domain length: {max(domain_lengths)} characters")
-    logger.info(f"Min domain length: {min(domain_lengths)} characters")
-    
-    # Create dataset
-    dataset = Dataset.from_dict({"text": domains})
-    
-    # Split into train/validation (90/10)
-    dataset_dict = dataset.train_test_split(test_size=0.1, seed=42)
-    
-    logger.info(f"Train examples: {len(dataset_dict['train']):,}")
-    logger.info(f"Validation examples: {len(dataset_dict['test']):,}")
-    
-    return dataset_dict['train'], dataset_dict['test']
+    return train_dataset, eval_dataset
 
 
-def tokenize_function(examples: Dict[str, list], tokenizer: CanineTokenizer, max_length: int) -> Dict[str, list]:
-    """
-    Tokenize domains for CANINE model.
+def train_epoch(model, dataloader, optimizer, scheduler, device, args, epoch, scaler, step_checkpoint_files: List[str], tokenizer):
+    """Train for one epoch with optimized settings."""
+    model.train()
+    total_loss = 0
+    accumulated_loss = 0
+    accumulated_samples = 0
     
-    Args:
-        examples: Batch of examples with 'text' field
-        tokenizer: CANINE tokenizer
-        max_length: Maximum sequence length
+    # Track recent losses for display
+    recent_losses = []
+    
+    pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}")
+    for batch_idx, batch in enumerate(pbar):
+        input_ids = batch['input_ids'].to(device)
+        attention_mask = batch['attention_mask'].to(device)
+        labels = batch['labels'].to(device)
         
-    Returns:
-        Tokenized examples
-    """
-    return tokenizer(
-        examples['text'],
-        truncation=True,
-        max_length=max_length,
-        padding='max_length',
-        return_special_tokens_mask=True,
-    )
+        # Mixed precision forward pass
+        if args.use_amp and scaler is not None:
+            with autocast():
+                outputs = model(input_ids, attention_mask, labels)
+                loss = outputs.loss / args.gradient_accumulation_steps
+            
+            scaler.scale(loss).backward()
+        else:
+            outputs = model(input_ids, attention_mask, labels)
+            loss = outputs.loss / args.gradient_accumulation_steps
+            loss.backward()
+        
+        # Accumulate loss for display
+        accumulated_loss += loss.item() * args.gradient_accumulation_steps
+        accumulated_samples += len(input_ids)
+        
+        # Update weights after accumulating gradients
+        if (batch_idx + 1) % args.gradient_accumulation_steps == 0:
+            if args.use_amp and scaler is not None:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.gradient_clip_val)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.gradient_clip_val)
+                optimizer.step()
+            
+            scheduler.step()
+            optimizer.zero_grad()
+            
+            # Calculate effective batch stats
+            avg_accumulated_loss = accumulated_loss / args.gradient_accumulation_steps
+            
+            # Track recent losses
+            recent_losses.append(avg_accumulated_loss)
+            if len(recent_losses) > 100:
+                recent_losses.pop(0)
+            
+            # Update progress bar
+            avg_recent_loss = np.mean(recent_losses) if recent_losses else avg_accumulated_loss
+            current_lr = scheduler.get_last_lr()[0]
+            
+            # Safely calculate perplexity (avoid overflow)
+            try:
+                ppl = math.exp(min(avg_recent_loss, 20))  # Cap at e^20 to avoid overflow
+            except (OverflowError, ValueError):
+                ppl = float('inf')
+            
+            pbar.set_postfix({
+                'loss': f'{avg_recent_loss:.4f}',
+                'lr': f'{current_lr:.2e}',
+                'ppl': f'{ppl:.2f}' if ppl < 1e6 else 'inf'
+            })
+            
+            # Log to wandb
+            if args.use_wandb and batch_idx % args.logging_steps == 0:
+                global_step = epoch * len(dataloader) + batch_idx + 1
+                try:
+                    wandb.log({
+                        'train_loss': avg_accumulated_loss,
+                        'train_perplexity': math.exp(avg_accumulated_loss),
+                        'learning_rate': current_lr,
+                        'epoch': epoch + 1,
+                        'global_step': global_step
+                    })
+                except Exception as e:
+                    logger.warning(f"Failed to log to wandb: {e}")
+            
+            # Reset accumulators
+            accumulated_loss = 0
+            accumulated_samples = 0
+        
+        total_loss += loss.item() * args.gradient_accumulation_steps
+        
+        # Save checkpoint every N steps
+        global_step = epoch * len(dataloader) + batch_idx + 1
+        if (batch_idx + 1) % args.save_steps == 0:
+            step_checkpoint_dir = os.path.join(args.output_dir, f'checkpoint-step-{global_step}')
+            os.makedirs(step_checkpoint_dir, exist_ok=True)
+            
+            # Save model and training state
+            try:
+                model.canine.save_pretrained(step_checkpoint_dir)
+                tokenizer.save_pretrained(step_checkpoint_dir)
+                torch.save({
+                'epoch': epoch,
+                'step': batch_idx + 1,
+                'global_step': global_step,
+                'mlm_head_state_dict': model.mlm_head.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'scaler_state_dict': scaler.state_dict() if scaler is not None else None,
+                'train_loss': total_loss / (batch_idx + 1),
+                'args': args,
+                }, os.path.join(step_checkpoint_dir, 'training_state.bin'))
+                
+                logger.info(f"Saved checkpoint at step {global_step}")
+            except Exception as e:
+                logger.error(f"Failed to save checkpoint: {e}")
+            
+            # Keep only the latest N step checkpoints
+            step_checkpoint_files.append(step_checkpoint_dir)
+            if len(step_checkpoint_files) > args.save_total_limit:
+                old_checkpoint = step_checkpoint_files.pop(0)
+                if os.path.exists(old_checkpoint):
+                    shutil.rmtree(old_checkpoint)
+                    logger.info(f"Removed old checkpoint: {old_checkpoint}")
+    
+    # Handle remaining gradients
+    if len(dataloader) % args.gradient_accumulation_steps != 0:
+        if args.use_amp and scaler is not None:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.gradient_clip_val)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.gradient_clip_val)
+            optimizer.step()
+        
+        scheduler.step()
+        optimizer.zero_grad()
+    
+    avg_loss = total_loss / len(dataloader)
+    return avg_loss
 
 
-class CanineDataCollatorForLanguageModeling:
-    """Custom data collator for CANINE MLM that uses Unicode codepoint masking."""
+def evaluate(model, dataloader, device, args):
+    """Evaluate the model and compute perplexity."""
+    model.eval()
+    total_loss = 0
     
-    def __init__(self, tokenizer, mlm_probability=0.15, mask_token_id=0xE000):
-        self.tokenizer = tokenizer
-        self.mlm_probability = mlm_probability
-        self.mask_token_id = mask_token_id  # Private use area character
-        
-    def __call__(self, examples):
-        # Stack all tensors
-        batch = {}
-        for key in examples[0].keys():
-            if key == 'special_tokens_mask':
-                continue
-            batch[key] = torch.stack([torch.tensor(ex[key]) for ex in examples])
-        
-        # Clone input_ids for labels
-        batch['labels'] = batch['input_ids'].clone()
-        
-        # Create probability matrix for masking
-        probability_matrix = torch.full(batch['labels'].shape, self.mlm_probability)
-        
-        # Don't mask special tokens (CLS=57344, SEP=57345, PAD=0)
-        special_tokens_mask = (
-            (batch['input_ids'] == 0) | 
-            (batch['input_ids'] == 57344) | 
-            (batch['input_ids'] == 57345)
-        )
-        probability_matrix.masked_fill_(special_tokens_mask, value=0.0)
-        
-        # Apply masking
-        masked_indices = torch.bernoulli(probability_matrix).bool()
-        batch['labels'][~masked_indices] = -100  # Only compute loss on masked tokens
-        
-        # Replace masked tokens with mask token
-        batch['input_ids'][masked_indices] = self.mask_token_id
-        
-        return batch
-
-
-def compute_metrics(eval_pred) -> Dict[str, float]:
-    """
-    Compute perplexity metric for evaluation.
+    with torch.no_grad():
+        for batch in tqdm(dataloader, desc="Evaluating"):
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            labels = batch['labels'].to(device)
+            
+            if args.use_amp:
+                with autocast():
+                    outputs = model(input_ids, attention_mask, labels)
+                    loss = outputs.loss
+            else:
+                outputs = model(input_ids, attention_mask, labels)
+                loss = outputs.loss
+            
+            total_loss += loss.item()
     
-    Args:
-        eval_pred: EvalPrediction object from trainer
-        
-    Returns:
-        Dictionary with perplexity metric
-    """
-    predictions, labels = eval_pred
+    avg_loss = total_loss / len(dataloader)
+    # Safely calculate perplexity
+    try:
+        perplexity = math.exp(min(avg_loss, 20))  # Cap to avoid overflow
+    except (OverflowError, ValueError):
+        perplexity = float('inf')
     
-    # Flatten predictions and labels
-    predictions = predictions.reshape(-1, predictions.shape[-1])
-    labels = labels.reshape(-1)
-    
-    # Calculate cross-entropy loss
-    loss_fct = torch.nn.CrossEntropyLoss(reduction='mean', ignore_index=-100)
-    loss = loss_fct(torch.from_numpy(predictions), torch.from_numpy(labels))
-    
-    # Convert to perplexity
-    perplexity = math.exp(loss.item())
-    
-    return {"perplexity": perplexity}
+    return avg_loss, perplexity
 
 
 def main():
@@ -368,137 +525,305 @@ def main():
     # Parse arguments
     args = parse_args()
     
-    # Set random seed
+    # Set random seeds for reproducibility (using transformers set_seed like train_canine_overfit.py)
     set_seed(args.seed)
     
-    # Setup logging
+    # Enable deterministic behavior
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    
+    # Setup W&B logging
     if args.use_wandb:
         try:
-            import wandb
             wandb.init(
-                project="domain-canine-pretrain",
-                config=vars(args),
-                name=f"canine-mlm-{args.epochs}ep-{args.batch_size}bs-{args.lr}lr"
+                project=args.wandb_project,
+                name=args.wandb_run_name or f"canine-mlm-{args.epochs}ep-{args.batch_size}bs",
+                config=vars(args)
             )
             logger.info("Weights & Biases logging enabled")
-        except ImportError:
-            logger.warning("wandb not installed. Disabling W&B logging.")
+        except Exception as e:
+            logger.warning(f"Failed to initialize wandb: {e}")
             args.use_wandb = False
     
-    # Detect device (prioritize MPS for Apple Silicon)
-    if torch.backends.mps.is_available():
-        device = torch.device("mps")
-        logger.info("Using Metal Performance Shaders (MPS) for M1/M2 acceleration")
-    elif torch.cuda.is_available():
+    # Detect device
+    if torch.cuda.is_available():
         device = torch.device("cuda")
-        logger.info(f"Using GPU: {torch.cuda.get_device_name()}")
-        logger.info(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+        gpu_name = torch.cuda.get_device_name()
+        gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1e9
+        logger.info(f"Using GPU: {gpu_name}")
+        logger.info(f"GPU Memory: {gpu_memory:.1f} GB")
+        
+        # A100-specific optimizations
+        if "A100" in gpu_name:
+            logger.info("Detected NVIDIA A100 - enabling optimizations")
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            logger.info("Enabled TF32 for matrix operations")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+        logger.info("Using Metal Performance Shaders (MPS)")
+        args.use_amp = False  # AMP not supported on MPS
     else:
         device = torch.device("cpu")
         logger.info("Using CPU (training will be slow)")
+        args.use_amp = False
+    
+    # Check mixed precision settings
+    if args.no_mixed_precision:
+        args.use_amp = False
+        args.fp16 = False
+        args.bf16 = False
+        logger.info("Mixed precision disabled")
+    elif args.use_amp and device.type == "cuda":
+        if args.bf16 and torch.cuda.is_bf16_supported():
+            logger.info("Using BF16 mixed precision")
+            # Set autocast dtype
+            torch.set_autocast_gpu_dtype(torch.bfloat16)
+        elif args.fp16:
+            logger.info("Using FP16 mixed precision")
+            torch.set_autocast_gpu_dtype(torch.float16)
+        else:
+            # Default to BF16 on A100, FP16 otherwise
+            if "A100" in torch.cuda.get_device_name() and torch.cuda.is_bf16_supported():
+                torch.set_autocast_gpu_dtype(torch.bfloat16)
+                logger.info("Using BF16 mixed precision (A100 default)")
+            else:
+                torch.set_autocast_gpu_dtype(torch.float16)
+                logger.info("Using FP16 mixed precision (default)")
+    
+    # Initialize GradScaler for mixed precision
+    scaler = GradScaler() if args.use_amp and device.type == "cuda" else None
     
     # Load and prepare data
-    train_dataset, eval_dataset = load_and_prepare_data(args.data_file)
+    train_dataset, eval_dataset = load_and_prepare_data(
+        dataset_name=args.dataset,
+        dataset_config=args.dataset_config,
+        dataset_split=args.dataset_split,
+        num_samples=args.num_samples,
+        streaming=args.streaming,
+        test_size=args.test_size
+    )
     
     # Load tokenizer and model
     logger.info("Loading CANINE tokenizer and model...")
     tokenizer = CanineTokenizer.from_pretrained('google/canine-c')
-    model = CanineForMaskedLM.from_pretrained('google/canine-c')
     
+    # Initialize or load model
+    if args.resume_from and os.path.exists(args.resume_from):
+        logger.info(f"Resuming from checkpoint: {args.resume_from}")
+        model = CanineForMaskedLM(CanineConfig.from_pretrained(args.resume_from))
+        model.canine = CanineModel.from_pretrained(args.resume_from)
+        
+        # Load training state
+        state_path = os.path.join(args.resume_from, 'training_state.bin')
+        checkpoint = None
+        if os.path.exists(state_path):
+            try:
+                checkpoint = torch.load(state_path, map_location='cpu')
+                model.mlm_head.load_state_dict(checkpoint['mlm_head_state_dict'])
+                start_epoch = checkpoint['epoch'] + 1
+                logger.info(f"Resumed from epoch {checkpoint['epoch']}")
+            except Exception as e:
+                logger.warning(f"Failed to load training state: {e}")
+                start_epoch = 0
+        else:
+            logger.warning(f"No training state found at {state_path}")
+            start_epoch = 0
+    else:
+        model = CanineForMaskedLM.from_pretrained('google/canine-c')
+        start_epoch = 0
+    
+    model.to(device)
     logger.info(f"Model parameters: {model.num_parameters():,}")
     
-    # Tokenize datasets
-    logger.info("Tokenizing datasets...")
-    tokenized_train = train_dataset.map(
-        lambda x: tokenize_function(x, tokenizer, args.max_length),
-        batched=True,
-        remove_columns=train_dataset.column_names,
-        desc="Tokenizing train dataset",
-    )
+    # Ensure model is in training mode
+    model.train()
     
-    tokenized_eval = eval_dataset.map(
-        lambda x: tokenize_function(x, tokenizer, args.max_length),
-        batched=True,
-        remove_columns=eval_dataset.column_names,
-        desc="Tokenizing eval dataset",
-    )
+    # Create datasets
+    try:
+        train_dataset_torch = DomainMLMDataset(train_dataset, tokenizer, args.max_length)
+        eval_dataset_torch = DomainMLMDataset(eval_dataset, tokenizer, args.max_length)
+    except Exception as e:
+        logger.error(f"Failed to create datasets: {e}")
+        raise
     
-    # Data collator for MLM - use custom collator for CANINE
+    # Data collator
     data_collator = CanineDataCollatorForLanguageModeling(
         tokenizer=tokenizer,
         mlm_probability=args.mlm_probability,
     )
     
-    # Training arguments
-    training_args = TrainingArguments(
-        output_dir=args.output_dir,
-        overwrite_output_dir=True,
-        num_train_epochs=args.epochs,
-        per_device_train_batch_size=args.batch_size,
-        per_device_eval_batch_size=args.batch_size,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        warmup_ratio=args.warmup_ratio,
-        weight_decay=args.weight_decay,
-        learning_rate=args.lr,
-        lr_scheduler_type="linear",
-        logging_dir=f"{args.output_dir}/logs",
-        logging_steps=args.logging_steps,
-        evaluation_strategy="steps",
-        eval_steps=args.eval_steps,
-        save_strategy="steps",
-        save_steps=args.save_steps,
-        save_total_limit=3,
-        load_best_model_at_end=True,
-        metric_for_best_model="eval_loss",
-        greater_is_better=False,
-        report_to=["wandb"] if args.use_wandb else [],
-        push_to_hub=False,
-        fp16=args.fp16 and device.type == "cuda",
-        dataloader_num_workers=4,
-        seed=args.seed,
+    # Determine number of workers
+    if args.num_workers is not None:
+        num_workers = args.num_workers
+    else:
+        num_workers = min(multiprocessing.cpu_count(), 16)
+    logger.info(f"Using {num_workers} DataLoader workers")
+    
+    # Create DataLoaders with optimizations
+    generator = torch.Generator()
+    generator.manual_seed(args.seed)
+    
+    train_loader = DataLoader(
+        train_dataset_torch,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        collate_fn=data_collator,
+        pin_memory=True,
+        persistent_workers=True if num_workers > 0 else False,
+        prefetch_factor=2 if num_workers > 0 else None,
+        generator=generator
     )
     
-    # Initialize trainer
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        data_collator=data_collator,
-        train_dataset=tokenized_train,
-        eval_dataset=tokenized_eval,
-        tokenizer=tokenizer,
-        compute_metrics=compute_metrics,
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=2)],
+    eval_loader = DataLoader(
+        eval_dataset_torch,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        collate_fn=data_collator,
+        pin_memory=True,
+        persistent_workers=True if num_workers > 0 else False,
+        prefetch_factor=2 if num_workers > 0 else None
     )
     
-    # Train
-    logger.info("Starting training...")
-    train_result = trainer.train()
+    # Initialize optimizer
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    
+    # Calculate total steps
+    total_steps = (len(train_loader) + args.gradient_accumulation_steps - 1) // args.gradient_accumulation_steps * args.epochs
+    
+    # Initialize scheduler
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=args.warmup_steps,
+        num_training_steps=total_steps
+    )
+    
+    # Load optimizer and scheduler states if resuming
+    if args.resume_from and 'checkpoint' in locals() and checkpoint is not None:
+        try:
+            if 'optimizer_state_dict' in checkpoint:
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                logger.info("Loaded optimizer state")
+            if 'scheduler_state_dict' in checkpoint:
+                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                logger.info("Loaded scheduler state")
+            if scaler is not None and 'scaler_state_dict' in checkpoint and checkpoint['scaler_state_dict'] is not None:
+                scaler.load_state_dict(checkpoint['scaler_state_dict'])
+                logger.info("Loaded scaler state")
+        except Exception as e:
+            logger.warning(f"Failed to load optimizer/scheduler state: {e}")
+            logger.warning("Starting with fresh optimizer/scheduler")
+    
+    logger.info(f"\nTraining setup:")
+    logger.info(f"  Total steps: {total_steps}")
+    logger.info(f"  Warmup steps: {args.warmup_steps}")
+    logger.info(f"  Effective batch size: {args.batch_size * args.gradient_accumulation_steps}")
+    logger.info(f"  Starting from epoch: {start_epoch}")
+    
+    # Training loop
+    best_eval_loss = float('inf')
+    patience_counter = 0
+    step_checkpoint_files = []
+    
+    for epoch in range(start_epoch, args.epochs):
+        logger.info(f"\nEpoch {epoch + 1}/{args.epochs}")
+        
+        # Train
+        train_loss = train_epoch(model, train_loader, optimizer, scheduler, device, args, epoch, scaler, step_checkpoint_files, tokenizer)
+        train_perplexity = math.exp(train_loss)
+        logger.info(f"Train Loss: {train_loss:.4f}, Train Perplexity: {train_perplexity:.2f}")
+        
+        # Evaluate
+        eval_loss, eval_perplexity = evaluate(model, eval_loader, device, args)
+        logger.info(f"Eval Loss: {eval_loss:.4f}, Eval Perplexity: {eval_perplexity:.2f}")
+        
+        # Log to wandb
+        if args.use_wandb:
+            try:
+                wandb.log({
+                    'epoch': epoch + 1,
+                    'train_loss': train_loss,
+                    'train_perplexity': train_perplexity,
+                    'eval_loss': eval_loss,
+                    'eval_perplexity': eval_perplexity,
+                })
+            except Exception as e:
+                logger.warning(f"Failed to log epoch metrics to wandb: {e}")
+        
+        # Save checkpoint
+        checkpoint_dir = os.path.join(args.output_dir, f'checkpoint-epoch-{epoch+1}')
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        
+        model.canine.save_pretrained(checkpoint_dir)
+        tokenizer.save_pretrained(checkpoint_dir)
+        
+        torch.save({
+            'epoch': epoch,
+            'mlm_head_state_dict': model.mlm_head.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'scaler_state_dict': scaler.state_dict() if scaler is not None else None,
+            'eval_loss': eval_loss,
+            'eval_perplexity': eval_perplexity,
+            'args': args,
+        }, os.path.join(checkpoint_dir, 'training_state.bin'))
+        
+        logger.info(f"Saved checkpoint: {checkpoint_dir}")
+        
+        # Save best model
+        if eval_loss < best_eval_loss:
+            best_eval_loss = eval_loss
+            patience_counter = 0
+            
+            best_model_dir = os.path.join(args.output_dir, 'best-model')
+            os.makedirs(best_model_dir, exist_ok=True)
+            
+            model.canine.save_pretrained(best_model_dir)
+            tokenizer.save_pretrained(best_model_dir)
+            
+            torch.save({
+                'epoch': epoch,
+                'mlm_head_state_dict': model.mlm_head.state_dict(),
+                'best_eval_loss': best_eval_loss,
+                'best_eval_perplexity': eval_perplexity,
+                'args': args,
+            }, os.path.join(best_model_dir, 'training_state.bin'))
+            
+            logger.info(f"Saved new best model with eval loss: {best_eval_loss:.4f}")
+        else:
+            patience_counter += 1
+            if patience_counter >= args.early_stopping_patience:
+                logger.info(f"Early stopping triggered! No improvement for {args.early_stopping_patience} epochs.")
+                break
     
     # Save final model
-    logger.info(f"Saving model to {args.output_dir}")
-    trainer.save_model()
-    tokenizer.save_pretrained(args.output_dir)
+    final_dir = os.path.join(args.output_dir, 'final-model')
+    os.makedirs(final_dir, exist_ok=True)
     
-    # Save training results
-    with open(os.path.join(args.output_dir, "train_results.txt"), "w") as f:
-        f.write(str(train_result))
+    model.canine.save_pretrained(final_dir)
+    tokenizer.save_pretrained(final_dir)
     
-    # Evaluate final model
-    logger.info("Running final evaluation...")
-    eval_results = trainer.evaluate()
+    torch.save({
+        'epoch': epoch,
+        'mlm_head_state_dict': model.mlm_head.state_dict(),
+        'final_eval_loss': eval_loss,
+        'final_eval_perplexity': eval_perplexity,
+        'best_eval_loss': best_eval_loss,
+        'args': args,
+    }, os.path.join(final_dir, 'training_state.bin'))
     
-    # Save evaluation results
-    with open(os.path.join(args.output_dir, "eval_results.txt"), "w") as f:
-        for key, value in eval_results.items():
-            f.write(f"{key}: {value}\n")
+    logger.info(f"\nTraining completed!")
+    logger.info(f"Best eval loss: {best_eval_loss:.4f}")
+    logger.info(f"Final model saved in: {final_dir}")
     
-    logger.info(f"Training complete! Model saved to {args.output_dir}")
-    logger.info(f"Final eval loss: {eval_results.get('eval_loss', 'N/A'):.4f}")
-    logger.info(f"Final perplexity: {eval_results.get('eval_perplexity', 'N/A'):.2f}")
-    
-    # Close wandb run
+    # Close wandb
     if args.use_wandb:
-        wandb.finish()
+        try:
+            wandb.finish()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
