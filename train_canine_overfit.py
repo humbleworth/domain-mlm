@@ -106,7 +106,7 @@ def main():
     set_seed(42)
     
     # Device setup
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
     
     # Load domains

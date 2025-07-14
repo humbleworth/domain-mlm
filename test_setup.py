@@ -38,19 +38,6 @@ def test_imports():
         print(f"✗ tqdm: {e}")
         return False
     
-    try:
-        import sklearn
-        print(f"✓ scikit-learn {sklearn.__version__}")
-    except ImportError as e:
-        print(f"✗ scikit-learn: {e}")
-        return False
-    
-    try:
-        import pandas
-        print(f"✓ pandas {pandas.__version__}")
-    except ImportError as e:
-        print(f"✗ pandas: {e}")
-        return False
     
     # Check numpy version
     print(f"✓ numpy {np.__version__}", end="")

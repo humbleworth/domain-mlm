@@ -24,7 +24,7 @@ import torch.nn.functional as F
 import wandb
 from datasets import Dataset, load_dataset
 from torch.utils.data import DataLoader
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 from tqdm import tqdm
 from transformers import (
     CanineModel,
@@ -163,24 +163,74 @@ class CanineDataCollatorForLanguageModeling:
         # Clone input_ids for labels
         batch['labels'] = batch['input_ids'].clone()
         
-        # Create probability matrix for masking
-        probability_matrix = torch.full(batch['labels'].shape, self.mlm_probability)
-        
         # Don't mask special tokens
         special_tokens_mask = (
             (batch['input_ids'] == self.pad_token_id) | 
             (batch['input_ids'] == self.cls_token_id) | 
             (batch['input_ids'] == self.sep_token_id)
         )
-        probability_matrix.masked_fill_(special_tokens_mask, value=0.0)
         
-        # Apply masking
-        masked_indices = torch.bernoulli(probability_matrix).bool()
-        batch['labels'][~masked_indices] = -100  # Only compute loss on masked tokens
+        # Process each sequence in the batch
+        for i in range(batch['input_ids'].shape[0]):
+            # Find valid positions (not special tokens)
+            valid_mask = ~special_tokens_mask[i]
+            valid_positions = valid_mask.nonzero(as_tuple=True)[0]
+            
+            if len(valid_positions) == 0:
+                continue
+                
+            # Calculate how many tokens to mask
+            num_to_mask = int(len(valid_positions) * self.mlm_probability)
+            
+            if num_to_mask == 0:
+                continue
+            
+            # Decide masking strategy: 80% contiguous, 20% random
+            if torch.rand(1).item() < 0.8 and num_to_mask > 1:
+                # Contiguous masking
+                remaining_to_mask = num_to_mask
+                masked_positions = []
+                
+                while remaining_to_mask > 0 and len(masked_positions) < len(valid_positions):
+                    # Choose span length (2-5 characters, but not more than remaining)
+                    span_length = min(torch.randint(2, 6, (1,)).item(), remaining_to_mask)
+                    
+                    # Find valid starting positions for this span
+                    max_start = len(valid_positions) - span_length + 1
+                    if max_start <= 0:
+                        break
+                        
+                    # Choose random start position
+                    start_idx = torch.randint(0, max_start, (1,)).item()
+                    
+                    # Check if positions are already masked
+                    span_positions = valid_positions[start_idx:start_idx + span_length].tolist()
+                    if not any(pos in masked_positions for pos in span_positions):
+                        masked_positions.extend(span_positions)
+                        remaining_to_mask -= span_length
+                
+                # Apply contiguous masking
+                for pos in masked_positions[:num_to_mask]:  # Ensure we don't mask too many
+                    batch['labels'][i, pos] = batch['input_ids'][i, pos].clone()
+                    batch['input_ids'][i, pos] = self.mask_token_id
+                    
+            else:
+                # Random masking (original approach)
+                # Randomly select positions to mask
+                perm = torch.randperm(len(valid_positions))
+                mask_positions = valid_positions[perm[:num_to_mask]]
+                
+                # Apply random masking
+                for pos in mask_positions:
+                    batch['labels'][i, pos] = batch['input_ids'][i, pos].clone()
+                    batch['input_ids'][i, pos] = self.mask_token_id
         
-        # Following the CANINE paper and train_canine_overfit.py approach:
-        # Replace masked positions with the mask token (0xE000)
-        batch['input_ids'][masked_indices] = self.mask_token_id
+        # Set labels to -100 for non-masked positions
+        mask = batch['input_ids'] != self.mask_token_id
+        batch['labels'][mask] = -100
+        
+        # Ensure special tokens in labels are always -100
+        batch['labels'][special_tokens_mask] = -100
         
         return batch
 
@@ -209,8 +259,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gradient_clip_val", type=float, default=1.0, help="Gradient clipping value")
     
     # Model arguments
-    parser.add_argument("--max_length", type=int, default=128, help="Maximum sequence length")
-    parser.add_argument("--mlm_probability", type=float, default=0.15, help="Masking probability for MLM")
+    parser.add_argument("--max_length", type=int, default=64, help="Maximum sequence length")
+    parser.add_argument("--mlm_probability", type=float, default=0.25, help="Masking probability for MLM")
     
     # Dataset arguments
     parser.add_argument("--dataset", type=str, default="humbleworth/registered-domains", help="HuggingFace dataset or local file")
@@ -218,11 +268,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset_split", type=str, default="train", help="Dataset split to use")
     parser.add_argument("--num_samples", type=int, default=None, help="Number of samples to use (None for all)")
     parser.add_argument("--streaming", action="store_true", help="Use streaming mode for large datasets")
-    parser.add_argument("--test_size", type=float, default=0.1, help="Validation set size as fraction")
+    parser.add_argument("--test_size", type=float, default=0.001, help="Validation set size as fraction")
     parser.add_argument("--num_workers", type=int, default=None, help="Number of DataLoader workers (default: auto)")
     
     # Output arguments
-    parser.add_argument("--output_dir", type=str, default="./domain-canine-model", help="Output directory")
+    parser.add_argument("--output_dir", type=str, default="./models/domain-canine-model", help="Output directory")
     parser.add_argument("--log_dir", type=str, default="./logs", help="TensorBoard log directory")
     parser.add_argument("--save_steps", type=int, default=10000, help="Save checkpoint every N steps")
     parser.add_argument("--logging_steps", type=int, default=100, help="Log every N steps")
@@ -337,7 +387,18 @@ def load_and_prepare_data(dataset_name: str, dataset_config: Optional[str] = Non
         eval_dataset = dataset.skip(skip_amount).take(take_amount)
         logger.info("Created train/eval splits for streaming dataset")
     else:
-        dataset_dict = dataset.train_test_split(test_size=test_size, seed=42)
+        # For very large datasets, use a more efficient splitting strategy
+        # train_test_split with keep_in_memory=False is optimized for large datasets
+        logger.info("Creating train/validation splits (this may take a moment for large datasets)...")
+        
+        # Use the optimized train_test_split with keep_in_memory=False
+        # This streams the data rather than loading it all into memory
+        dataset_dict = dataset.train_test_split(
+            test_size=test_size, 
+            seed=42,
+            keep_in_memory=False,  # Critical for large datasets
+            load_from_cache_file=True  # Use cache if available
+        )
         train_dataset = dataset_dict['train']
         eval_dataset = dataset_dict['test']
         
@@ -347,7 +408,7 @@ def load_and_prepare_data(dataset_name: str, dataset_config: Optional[str] = Non
     return train_dataset, eval_dataset
 
 
-def train_epoch(model, dataloader, optimizer, scheduler, device, args, epoch, scaler, step_checkpoint_files: List[str], tokenizer):
+def train_epoch(model, dataloader, optimizer, scheduler, device, args, epoch, scaler, step_checkpoint_files: List[str], tokenizer, total_steps):
     """Train for one epoch with optimized settings."""
     model.train()
     total_loss = 0
@@ -365,7 +426,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, args, epoch, sc
         
         # Mixed precision forward pass
         if args.use_amp and scaler is not None:
-            with autocast():
+            with autocast('cuda'):
                 outputs = model(input_ids, attention_mask, labels)
                 loss = outputs.loss / args.gradient_accumulation_steps
             
@@ -401,8 +462,13 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, args, epoch, sc
             if len(recent_losses) > 100:
                 recent_losses.pop(0)
             
-            # Update progress bar
-            avg_recent_loss = np.mean(recent_losses) if recent_losses else avg_accumulated_loss
+            # Reset accumulators
+            accumulated_loss = 0
+            accumulated_samples = 0
+        
+        # Calculate current stats for progress bar and logging (outside accumulation block)
+        if len(recent_losses) > 0:
+            avg_recent_loss = np.mean(recent_losses)
             current_lr = scheduler.get_last_lr()[0]
             
             # Safely calculate perplexity (avoid overflow)
@@ -411,29 +477,55 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, args, epoch, sc
             except (OverflowError, ValueError):
                 ppl = float('inf')
             
+            # Calculate additional stats
+            # Calculate the actual global step based on optimizer steps
+            actual_steps_taken = ((batch_idx + 1) + args.gradient_accumulation_steps - 1) // args.gradient_accumulation_steps
+            global_step = epoch * ((len(dataloader) + args.gradient_accumulation_steps - 1) // args.gradient_accumulation_steps) + actual_steps_taken
+            
+            steps_per_sec = pbar.format_dict['rate'] if pbar.format_dict['rate'] else 0
+            samples_per_sec = steps_per_sec * args.batch_size if steps_per_sec else 0
+            gpu_memory_used = torch.cuda.memory_allocated() / 1e9 if torch.cuda.is_available() else 0
+            
             pbar.set_postfix({
                 'loss': f'{avg_recent_loss:.4f}',
+                'ppl': f'{ppl:.2f}' if ppl < 1e6 else 'inf',
                 'lr': f'{current_lr:.2e}',
-                'ppl': f'{ppl:.2f}' if ppl < 1e6 else 'inf'
+                'step': f'{global_step}/{total_steps}',
+                'samples/s': f'{samples_per_sec:.0f}',
+                'gpu_gb': f'{gpu_memory_used:.1f}'
             })
             
-            # Log to wandb
-            if args.use_wandb and batch_idx % args.logging_steps == 0:
-                global_step = epoch * len(dataloader) + batch_idx + 1
+            # Log to wandb - check if we should log based on actual optimizer steps
+            # Also force logging every 1000 batches as a safety net
+            should_log = (global_step % args.logging_steps == 0 or 
+                         global_step == 1 or 
+                         batch_idx % 1000 == 0 or
+                         batch_idx == 10)  # Log early to verify it's working
+            
+            if args.use_wandb and should_log:
                 try:
+                    # Calculate gradient norm if available
+                    total_norm = 0.0
+                    if (batch_idx + 1) % args.gradient_accumulation_steps == 0:
+                        for p in model.parameters():
+                            if p.grad is not None:
+                                param_norm = p.grad.data.norm(2)
+                                total_norm += param_norm.item() ** 2
+                        total_norm = total_norm ** 0.5
+                    
                     wandb.log({
-                        'train_loss': avg_accumulated_loss,
-                        'train_perplexity': math.exp(avg_accumulated_loss),
-                        'learning_rate': current_lr,
-                        'epoch': epoch + 1,
-                        'global_step': global_step
-                    })
+                        'train/loss': avg_recent_loss,
+                        'train/perplexity': ppl,
+                        'train/learning_rate': current_lr,
+                        'train/epoch': epoch + (batch_idx + 1) / len(dataloader),
+                        'train/global_step': global_step,
+                        'train/samples_per_second': samples_per_sec,
+                        'train/gpu_memory_gb': gpu_memory_used,
+                        'train/gradient_norm': total_norm if total_norm > 0 else None,
+                        'train/progress': global_step / total_steps
+                    }, step=global_step)
                 except Exception as e:
                     logger.warning(f"Failed to log to wandb: {e}")
-            
-            # Reset accumulators
-            accumulated_loss = 0
-            accumulated_samples = 0
         
         total_loss += loss.item() * args.gradient_accumulation_steps
         
@@ -501,7 +593,7 @@ def evaluate(model, dataloader, device, args):
             labels = batch['labels'].to(device)
             
             if args.use_amp:
-                with autocast():
+                with autocast('cuda'):
                     outputs = model(input_ids, attention_mask, labels)
                     loss = outputs.loss
             else:
@@ -592,7 +684,7 @@ def main():
                 logger.info("Using FP16 mixed precision (default)")
     
     # Initialize GradScaler for mixed precision
-    scaler = GradScaler() if args.use_amp and device.type == "cuda" else None
+    scaler = GradScaler('cuda') if args.use_amp and device.type == "cuda" else None
     
     # Load and prepare data
     train_dataset, eval_dataset = load_and_prepare_data(
@@ -731,7 +823,7 @@ def main():
         logger.info(f"\nEpoch {epoch + 1}/{args.epochs}")
         
         # Train
-        train_loss = train_epoch(model, train_loader, optimizer, scheduler, device, args, epoch, scaler, step_checkpoint_files, tokenizer)
+        train_loss = train_epoch(model, train_loader, optimizer, scheduler, device, args, epoch, scaler, step_checkpoint_files, tokenizer, total_steps)
         train_perplexity = math.exp(train_loss)
         logger.info(f"Train Loss: {train_loss:.4f}, Train Perplexity: {train_perplexity:.2f}")
         
@@ -744,10 +836,10 @@ def main():
             try:
                 wandb.log({
                     'epoch': epoch + 1,
-                    'train_loss': train_loss,
-                    'train_perplexity': train_perplexity,
-                    'eval_loss': eval_loss,
-                    'eval_perplexity': eval_perplexity,
+                    'train/epoch_loss': train_loss,
+                    'train/epoch_perplexity': train_perplexity,
+                    'eval/loss': eval_loss,
+                    'eval/perplexity': eval_perplexity,
                 })
             except Exception as e:
                 logger.warning(f"Failed to log epoch metrics to wandb: {e}")
